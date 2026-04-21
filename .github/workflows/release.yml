@@ -1,0 +1,79 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (например, v1.2.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+          cache: true
+
+      - name: Build Linux binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            if [[ "${{ github.event.inputs.tag }}" != v* ]]; then
+              echo "Tag must start with 'v' (example: v1.2.0)"
+              exit 1
+            fi
+          fi
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o dist/tg-anti-spam-linux-amd64 ./cmd/bot
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o dist/tg-anti-spam-linux-arm64 ./cmd/bot
+
+      - name: Package binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -C dist -czf dist/tg-anti-spam-linux-amd64.tar.gz tg-anti-spam-linux-amd64
+          tar -C dist -czf dist/tg-anti-spam-linux-arm64.tar.gz tg-anti-spam-linux-arm64
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum tg-anti-spam-linux-amd64.tar.gz tg-anti-spam-linux-arm64.tar.gz > SHA256SUMS
+
+      - name: Set release tag
+        id: release_tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            echo "value=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_tag.outputs.value }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          files: |
+            dist/tg-anti-spam-linux-amd64.tar.gz
+            dist/tg-anti-spam-linux-arm64.tar.gz
+            dist/SHA256SUMS

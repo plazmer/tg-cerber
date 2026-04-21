@@ -59,6 +59,30 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build-linux.ps1 -Arch arm64
 ```
 
 Бинарники: `dist/tg-anti-spam-linux-amd64`, `dist/tg-anti-spam-linux-arm64`.
+Архивы: `dist/tg-anti-spam-linux-amd64.tar.gz`, `dist/tg-anti-spam-linux-arm64.tar.gz`.
+
+## Автопубликация релизов в GitHub
+
+В репозитории настроен workflow `.github/workflows/release.yml`.
+
+Что происходит:
+
+- при пуше тега формата `v*` (например `v1.2.0`) запускается GitHub Actions;
+- собираются Linux-бинарники `amd64` и `arm64`;
+- бинарники упаковываются в `.tar.gz`;
+- публикуется GitHub Release с архивами и файлом `SHA256SUMS`.
+
+Как выпустить релиз:
+
+```powershell
+git tag v1.2.0
+git push origin v1.2.0
+```
+
+Ручной запуск:
+
+- в GitHub откройте `Actions` -> `Release` -> `Run workflow`;
+- укажите `tag` в формате `v*` (например `v1.2.0`).
 
 ## Запуск на Alpine Linux
 
