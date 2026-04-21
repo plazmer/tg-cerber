@@ -38,6 +38,21 @@ func (s *Service) Bootstrap(ctx context.Context) error {
 		return fmt.Errorf("get me: %w", err)
 	}
 	s.botUser = me
+
+	duplicates, err := s.store.SanitizeDuplicatePending(ctx)
+	if err != nil {
+		return fmt.Errorf("sanitize duplicate pending: %w", err)
+	}
+	for _, duplicate := range duplicates {
+		if duplicate.GroupPromptMessageID == 0 {
+			continue
+		}
+		if err := s.tg.DeleteMessage(ctx, duplicate.GroupChatID, duplicate.GroupPromptMessageID); err != nil {
+			s.logger.Debug("failed to delete duplicate prompt during sanitize", "token", duplicate.Token, "chat_id", duplicate.GroupChatID, "message_id", duplicate.GroupPromptMessageID, "error", err)
+			continue
+		}
+	}
+
 	return nil
 }
 
@@ -65,10 +80,25 @@ func (s *Service) handleChatMember(ctx context.Context, cm *telegram.ChatMemberU
 
 	userID := cm.NewChatMember.User.ID
 	chatID := cm.Chat.ID
+	if _, err := s.store.GetPendingByChatUser(ctx, chatID, userID); err == nil {
+		s.logger.Debug("skip duplicate join event", "chat_id", chatID, "user_id", userID)
+		return nil
+	} else if err != sql.ErrNoRows {
+		return fmt.Errorf("check pending by chat user: %w", err)
+	}
 
 	if err := s.tg.RestrictAll(ctx, chatID, userID); err != nil {
 		return fmt.Errorf("restrict member: %w", err)
 	}
+	restricted := true
+	defer func() {
+		if !restricted {
+			return
+		}
+		if err := s.tg.Unrestrict(context.Background(), chatID, userID); err != nil {
+			s.logger.Error("compensation unrestrict failed", "chat_id", chatID, "user_id", userID, "error", err)
+		}
+	}()
 
 	token, err := generateToken()
 	if err != nil {
@@ -95,6 +125,7 @@ func (s *Service) handleChatMember(ctx context.Context, cm *telegram.ChatMemberU
 		return fmt.Errorf("save group prompt message id: %w", err)
 	}
 	go s.deletePromptAfterTimeout(chatID, promptMsg.MessageID, time.Minute)
+	restricted = false
 
 	s.logger.Info("new user restricted and prompted", "chat_id", chatID, "user_id", userID, "token", token)
 	return nil
@@ -108,41 +139,9 @@ func (s *Service) handleMessage(ctx context.Context, message *telegram.Message) 
 }
 
 func (s *Service) handleGroupMessage(ctx context.Context, message *telegram.Message) error {
-	for _, user := range message.NewChatMembers {
-		if user.IsBot {
-			continue
-		}
-
-		if err := s.tg.RestrictAll(ctx, message.Chat.ID, user.ID); err != nil {
-			return fmt.Errorf("restrict member from service message: %w", err)
-		}
-
-		token, err := generateToken()
-		if err != nil {
-			return err
-		}
-		groupLink := buildGroupLink(message.Chat.Username, message.Chat.Title)
-		if err := s.store.UpsertPending(ctx, store.Verification{
-			Token:       token,
-			GroupChatID: message.Chat.ID,
-			UserID:      user.ID,
-			GroupLink:   groupLink,
-			Status:      store.StatusPending,
-		}); err != nil {
-			return fmt.Errorf("save pending from service message: %w", err)
-		}
-
-		deepLink := telegram.BuildDeepLink(s.botUser.Username, token)
-		prompt := fmt.Sprintf(s.cfg.GroupPromptText, deepLink)
-		promptMsg, err := s.tg.SendMessageWithResult(ctx, message.Chat.ID, prompt, nil)
-		if err != nil {
-			return fmt.Errorf("send group prompt: %w", err)
-		}
-		if err := s.store.SetGroupPromptMessageID(ctx, token, promptMsg.MessageID); err != nil {
-			return fmt.Errorf("save group prompt message id: %w", err)
-		}
-		go s.deletePromptAfterTimeout(message.Chat.ID, promptMsg.MessageID, time.Minute)
-	}
+	// Идемпотентный контур верификации работает только через chat_member.
+	// Сервисные сообщения new_chat_members здесь намеренно игнорируются, чтобы исключить дубли.
+	_ = message
 	return nil
 }
 

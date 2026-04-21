@@ -76,6 +76,9 @@ CREATE INDEX IF NOT EXISTS idx_pending_user_status ON pending_verifications(user
 			return fmt.Errorf("add group_link: %w", err)
 		}
 	}
+	if _, err := r.db.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS ux_pending_group_user ON pending_verifications(group_chat_id, user_id) WHERE status = 'pending';`); err != nil {
+		return fmt.Errorf("create pending unique index: %w", err)
+	}
 	return nil
 }
 
@@ -128,6 +131,99 @@ LIMIT 1;
 		return nil, err
 	}
 	return ver, nil
+}
+
+func (r *SQLiteRepository) GetPendingByChatUser(ctx context.Context, chatID int64, userID int64) (*Verification, error) {
+	const query = `
+SELECT token, group_chat_id, user_id, status, question_sent, owner_status_message_id, group_prompt_message_id, group_link, created_at, updated_at
+FROM pending_verifications
+WHERE group_chat_id = ? AND user_id = ? AND status = ?
+ORDER BY created_at DESC
+LIMIT 1;
+`
+	row := r.db.QueryRowContext(ctx, query, chatID, userID, string(StatusPending))
+	ver, err := scanVerification(row)
+	if err != nil {
+		return nil, err
+	}
+	return ver, nil
+}
+
+func (r *SQLiteRepository) SanitizeDuplicatePending(ctx context.Context) ([]Verification, error) {
+	const duplicatesQuery = `
+SELECT token, group_chat_id, user_id, status, question_sent, owner_status_message_id, group_prompt_message_id, group_link, created_at, updated_at
+FROM (
+	SELECT
+		token, group_chat_id, user_id, status, question_sent, owner_status_message_id, group_prompt_message_id, group_link, created_at, updated_at,
+		ROW_NUMBER() OVER (
+			PARTITION BY group_chat_id, user_id
+			ORDER BY datetime(created_at) DESC, token DESC
+		) AS rn
+	FROM pending_verifications
+	WHERE status = ?
+)
+WHERE rn > 1;
+`
+
+	rows, err := r.db.QueryContext(ctx, duplicatesQuery, string(StatusPending))
+	if err != nil {
+		return nil, fmt.Errorf("query duplicate pending rows: %w", err)
+	}
+	defer rows.Close()
+
+	duplicates := make([]Verification, 0)
+	for rows.Next() {
+		var v Verification
+		var status string
+		var createdRaw string
+		var updatedRaw string
+		var sentInt int
+		if err := rows.Scan(&v.Token, &v.GroupChatID, &v.UserID, &status, &sentInt, &v.OwnerStatusMessageID, &v.GroupPromptMessageID, &v.GroupLink, &createdRaw, &updatedRaw); err != nil {
+			return nil, fmt.Errorf("scan duplicate pending row: %w", err)
+		}
+		v.Status = Status(status)
+		v.QuestionSent = sentInt == 1
+		createdAt, err := parseSQLiteTime(createdRaw)
+		if err != nil {
+			return nil, fmt.Errorf("parse duplicate created_at: %w", err)
+		}
+		updatedAt, err := parseSQLiteTime(updatedRaw)
+		if err != nil {
+			return nil, fmt.Errorf("parse duplicate updated_at: %w", err)
+		}
+		v.CreatedAt = createdAt
+		v.UpdatedAt = updatedAt
+		duplicates = append(duplicates, v)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate duplicate pending rows: %w", err)
+	}
+
+	if len(duplicates) == 0 {
+		return duplicates, nil
+	}
+
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin sanitize transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	for _, duplicate := range duplicates {
+		if _, err := tx.ExecContext(ctx, `
+UPDATE pending_verifications
+SET status = ?, updated_at = CURRENT_TIMESTAMP
+WHERE token = ? AND status = ?;
+`, string(StatusCancelled), duplicate.Token, string(StatusPending)); err != nil {
+			return nil, fmt.Errorf("cancel duplicate pending token %s: %w", duplicate.Token, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit sanitize transaction: %w", err)
+	}
+
+	return duplicates, nil
 }
 
 func (r *SQLiteRepository) SetStatus(ctx context.Context, token string, status Status) error {
