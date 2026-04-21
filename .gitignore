@@ -1,0 +1,22 @@
+# Build artifacts
+/dist/
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Go workspace artifacts
+/bin/
+/tmp/
+
+# Runtime data
+*.db
+*.db-shm
+*.db-wal
+
+# Environment files
+.env
+.env.local
+.env.*.local
