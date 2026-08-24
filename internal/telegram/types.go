@@ -1,10 +1,28 @@
 package telegram
 
 type Update struct {
-	UpdateID      int64             `json:"update_id"`
-	Message       *Message          `json:"message,omitempty"`
-	ChatMember    *ChatMemberUpdate `json:"chat_member,omitempty"`
-	CallbackQuery *CallbackQuery    `json:"callback_query,omitempty"`
+	UpdateID        int64             `json:"update_id"`
+	Message         *Message          `json:"message,omitempty"`
+	ChatMember      *ChatMemberUpdate `json:"chat_member,omitempty"`
+	ChatJoinRequest *ChatJoinRequest  `json:"chat_join_request,omitempty"`
+	CallbackQuery   *CallbackQuery    `json:"callback_query,omitempty"`
+}
+
+// ChatJoinRequest — заявка на вступление в группу с включенным режимом заявок.
+type ChatJoinRequest struct {
+	Chat Chat `json:"chat"`
+	From User `json:"from"`
+	// UserChatID — приватный чат заявителя. Пока заявка не обработана,
+	// боту разрешено писать в него даже без нажатого Start.
+	UserChatID int64           `json:"user_chat_id"`
+	Date       int64           `json:"date"`
+	Bio        string          `json:"bio,omitempty"`
+	InviteLink *ChatInviteLink `json:"invite_link,omitempty"`
+}
+
+type ChatInviteLink struct {
+	InviteLink string `json:"invite_link"`
+	Name       string `json:"name,omitempty"`
 }
 
 type ChatMemberUpdate struct {
@@ -21,13 +39,10 @@ type ChatMember struct {
 }
 
 type Message struct {
-	MessageID      int64    `json:"message_id"`
-	From           *User    `json:"from,omitempty"`
-	ForwardFrom    *User    `json:"forward_from,omitempty"`
-	Chat           Chat     `json:"chat"`
-	Text           string   `json:"text,omitempty"`
-	NewChatMembers []User   `json:"new_chat_members,omitempty"`
-	ReplyToMessage *Message `json:"reply_to_message,omitempty"`
+	MessageID int64  `json:"message_id"`
+	From      *User  `json:"from,omitempty"`
+	Chat      Chat   `json:"chat"`
+	Text      string `json:"text,omitempty"`
 }
 
 type CallbackQuery struct {

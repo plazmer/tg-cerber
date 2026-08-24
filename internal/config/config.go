@@ -5,17 +5,19 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type Config struct {
-	BotToken        string
-	OwnerID         int64
-	WebhookSecret   string
-	WebhookPath     string
-	ListenAddr      string
-	DBPath          string
-	BotQuestion     string
-	GroupPromptText string
+	BotToken      string
+	OwnerID       int64
+	WebhookSecret string
+	WebhookPath   string
+	ListenAddr    string
+	DBPath        string
+	// PendingTTL — через сколько нерассмотренная заявка отклоняется автоматически.
+	// 0 (по умолчанию) — авто-отклонение выключено, заявка ждет решения владельца.
+	PendingTTL time.Duration
 }
 
 func Load() (Config, error) {
@@ -37,15 +39,19 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("parse OWNER_ID: %w", err)
 	}
 
+	pendingTTL, err := optionalDuration("PENDING_TTL", 0)
+	if err != nil {
+		return Config{}, err
+	}
+
 	cfg := Config{
-		BotToken:        botToken,
-		OwnerID:         ownerID,
-		WebhookSecret:   webhookSecret,
-		WebhookPath:     optional("WEBHOOK_PATH", "/webhook"),
-		ListenAddr:      optional("LISTEN_ADDR", ":8080"),
-		DBPath:          optional("DB_PATH", "bot.db"),
-		BotQuestion:     optional("BOT_QUESTION", "Здравствуйте! Напишите, пожалуйста, зачем вы вступили в группу."),
-		GroupPromptText: optional("GROUP_PROMPT_TEXT", "Для доступа к чату начните диалог с ботом: %s"),
+		BotToken:      botToken,
+		OwnerID:       ownerID,
+		WebhookSecret: webhookSecret,
+		WebhookPath:   optional("WEBHOOK_PATH", "/webhook"),
+		ListenAddr:    optional("LISTEN_ADDR", ":8080"),
+		DBPath:        optional("DB_PATH", "bot.db"),
+		PendingTTL:    pendingTTL,
 	}
 
 	return cfg, nil
@@ -65,4 +71,19 @@ func optional(name string, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+func optionalDuration(name string, fallback time.Duration) (time.Duration, error) {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return fallback, nil
+	}
+	parsed, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf("parse %s: %w", name, err)
+	}
+	if parsed < 0 {
+		return 0, fmt.Errorf("parse %s: must not be negative", name)
+	}
+	return parsed, nil
 }

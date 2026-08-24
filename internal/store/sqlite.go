@@ -5,10 +5,13 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
 )
+
+const sqliteTimeLayout = "2006-01-02 15:04:05"
 
 type SQLiteRepository struct {
 	db *sql.DB
@@ -19,216 +22,147 @@ func NewSQLiteRepository(path string) (*SQLiteRepository, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
+	// Один писатель: обработчики апдейтов и фоновый janitor ходят в БД параллельно.
+	db.SetMaxOpenConns(1)
+
+	if _, err := db.ExecContext(context.Background(), `PRAGMA busy_timeout = 5000;`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("set busy_timeout: %w", err)
+	}
+	if _, err := db.ExecContext(context.Background(), `PRAGMA journal_mode = WAL;`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("set journal_mode: %w", err)
+	}
 
 	repo := &SQLiteRepository{db: db}
 	if err := repo.migrate(context.Background()); err != nil {
+		db.Close()
 		return nil, err
 	}
 
 	return repo, nil
 }
 
+func (r *SQLiteRepository) Close() error {
+	return r.db.Close()
+}
+
+// migrate создает схему нового контура заявок.
+// Таблица pending_verifications от прежнего flow не трогается и не удаляется.
 func (r *SQLiteRepository) migrate(ctx context.Context) error {
 	const schema = `
-CREATE TABLE IF NOT EXISTS pending_verifications (
+CREATE TABLE IF NOT EXISTS join_requests (
 	token TEXT PRIMARY KEY,
 	group_chat_id INTEGER NOT NULL,
-	user_id INTEGER NOT NULL,
-	status TEXT NOT NULL,
-	question_sent INTEGER NOT NULL DEFAULT 0,
-	owner_status_message_id INTEGER NOT NULL DEFAULT 0,
-	group_prompt_message_id INTEGER NOT NULL DEFAULT 0,
+	group_title TEXT NOT NULL DEFAULT '',
 	group_link TEXT NOT NULL DEFAULT '',
+	user_id INTEGER NOT NULL,
+	user_chat_id INTEGER NOT NULL DEFAULT 0,
+	user_label TEXT NOT NULL DEFAULT '',
+	bio TEXT NOT NULL DEFAULT '',
+	owner_status_message_id INTEGER NOT NULL DEFAULT 0,
+	status TEXT NOT NULL,
 	created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
 	updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX IF NOT EXISTS idx_pending_group_user ON pending_verifications(group_chat_id, user_id);
-CREATE INDEX IF NOT EXISTS idx_pending_user_status ON pending_verifications(user_id, status);
+CREATE INDEX IF NOT EXISTS idx_join_requests_user_status ON join_requests(user_id, status);
+CREATE INDEX IF NOT EXISTS idx_join_requests_status_created ON join_requests(status, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_join_requests_pending ON join_requests(group_chat_id, user_id) WHERE status = 'pending';
+
+CREATE TABLE IF NOT EXISTS processed_updates (
+	update_id INTEGER PRIMARY KEY,
+	created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_processed_updates_created ON processed_updates(created_at);
 `
 	if _, err := r.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("apply schema: %w", err)
 	}
-	exists, err := r.columnExists(ctx, "pending_verifications", "owner_status_message_id")
+	return nil
+}
+
+const joinRequestColumns = `token, group_chat_id, group_title, group_link, user_id, user_chat_id, user_label, bio, owner_status_message_id, status, created_at, updated_at`
+
+func (r *SQLiteRepository) Create(ctx context.Context, req JoinRequest) error {
+	const query = `
+INSERT INTO join_requests(token, group_chat_id, group_title, group_link, user_id, user_chat_id, user_label, bio, owner_status_message_id, status, created_at, updated_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+ON CONFLICT(group_chat_id, user_id) WHERE status = 'pending' DO NOTHING;
+`
+	result, err := r.db.ExecContext(ctx, query,
+		req.Token, req.GroupChatID, req.GroupTitle, req.GroupLink,
+		req.UserID, req.UserChatID, req.UserLabel, req.Bio,
+		req.OwnerStatusMessageID, string(req.Status))
 	if err != nil {
-		return fmt.Errorf("check owner_status_message_id existence: %w", err)
+		return fmt.Errorf("insert join request: %w", err)
 	}
-	if !exists {
-		if _, err := r.db.ExecContext(ctx, `ALTER TABLE pending_verifications ADD COLUMN owner_status_message_id INTEGER NOT NULL DEFAULT 0;`); err != nil {
-			return fmt.Errorf("add owner_status_message_id: %w", err)
-		}
-	}
-	exists, err = r.columnExists(ctx, "pending_verifications", "group_prompt_message_id")
+	affected, err := result.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("check group_prompt_message_id existence: %w", err)
+		return fmt.Errorf("insert join request rows affected: %w", err)
 	}
-	if !exists {
-		if _, err := r.db.ExecContext(ctx, `ALTER TABLE pending_verifications ADD COLUMN group_prompt_message_id INTEGER NOT NULL DEFAULT 0;`); err != nil {
-			return fmt.Errorf("add group_prompt_message_id: %w", err)
-		}
-	}
-	exists, err = r.columnExists(ctx, "pending_verifications", "group_link")
-	if err != nil {
-		return fmt.Errorf("check group_link existence: %w", err)
-	}
-	if !exists {
-		if _, err := r.db.ExecContext(ctx, `ALTER TABLE pending_verifications ADD COLUMN group_link TEXT NOT NULL DEFAULT '';`); err != nil {
-			return fmt.Errorf("add group_link: %w", err)
-		}
-	}
-	if _, err := r.db.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS ux_pending_group_user ON pending_verifications(group_chat_id, user_id) WHERE status = 'pending';`); err != nil {
-		return fmt.Errorf("create pending unique index: %w", err)
+	if affected == 0 {
+		return ErrDuplicatePending
 	}
 	return nil
 }
 
-func (r *SQLiteRepository) UpsertPending(ctx context.Context, v Verification) error {
-	const query = `
-INSERT INTO pending_verifications(token, group_chat_id, user_id, status, question_sent, owner_status_message_id, group_prompt_message_id, group_link, created_at, updated_at)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-ON CONFLICT(token) DO UPDATE SET
-	group_chat_id = excluded.group_chat_id,
-	user_id = excluded.user_id,
-	status = excluded.status,
-	question_sent = excluded.question_sent,
-	owner_status_message_id = excluded.owner_status_message_id,
-	group_prompt_message_id = excluded.group_prompt_message_id,
-	group_link = excluded.group_link,
-	updated_at = CURRENT_TIMESTAMP;
-`
-	_, err := r.db.ExecContext(ctx, query, v.Token, v.GroupChatID, v.UserID, string(v.Status), boolToInt(v.QuestionSent), v.OwnerStatusMessageID, v.GroupPromptMessageID, v.GroupLink)
-	if err != nil {
-		return fmt.Errorf("upsert pending: %w", err)
-	}
-	return nil
+func (r *SQLiteRepository) GetByToken(ctx context.Context, token string) (*JoinRequest, error) {
+	query := `SELECT ` + joinRequestColumns + ` FROM join_requests WHERE token = ?;`
+	return scanJoinRequestRow(r.db.QueryRowContext(ctx, query, token))
 }
 
-func (r *SQLiteRepository) GetByToken(ctx context.Context, token string) (*Verification, error) {
-	const query = `
-SELECT token, group_chat_id, user_id, status, question_sent, owner_status_message_id, group_prompt_message_id, group_link, created_at, updated_at
-FROM pending_verifications
-WHERE token = ?;
-`
-	row := r.db.QueryRowContext(ctx, query, token)
-	ver, err := scanVerification(row)
-	if err != nil {
-		return nil, err
-	}
-	return ver, nil
-}
-
-func (r *SQLiteRepository) GetPendingByUser(ctx context.Context, userID int64) (*Verification, error) {
-	const query = `
-SELECT token, group_chat_id, user_id, status, question_sent, owner_status_message_id, group_prompt_message_id, group_link, created_at, updated_at
-FROM pending_verifications
-WHERE user_id = ? AND status = ?
-ORDER BY created_at DESC
-LIMIT 1;
-`
-	row := r.db.QueryRowContext(ctx, query, userID, string(StatusPending))
-	ver, err := scanVerification(row)
-	if err != nil {
-		return nil, err
-	}
-	return ver, nil
-}
-
-func (r *SQLiteRepository) GetPendingByChatUser(ctx context.Context, chatID int64, userID int64) (*Verification, error) {
-	const query = `
-SELECT token, group_chat_id, user_id, status, question_sent, owner_status_message_id, group_prompt_message_id, group_link, created_at, updated_at
-FROM pending_verifications
+func (r *SQLiteRepository) GetPendingByChatUser(ctx context.Context, chatID int64, userID int64) (*JoinRequest, error) {
+	query := `SELECT ` + joinRequestColumns + `
+FROM join_requests
 WHERE group_chat_id = ? AND user_id = ? AND status = ?
 ORDER BY created_at DESC
-LIMIT 1;
-`
-	row := r.db.QueryRowContext(ctx, query, chatID, userID, string(StatusPending))
-	ver, err := scanVerification(row)
-	if err != nil {
-		return nil, err
-	}
-	return ver, nil
+LIMIT 1;`
+	return scanJoinRequestRow(r.db.QueryRowContext(ctx, query, chatID, userID, string(StatusPending)))
 }
 
-func (r *SQLiteRepository) SanitizeDuplicatePending(ctx context.Context) ([]Verification, error) {
-	const duplicatesQuery = `
-SELECT token, group_chat_id, user_id, status, question_sent, owner_status_message_id, group_prompt_message_id, group_link, created_at, updated_at
-FROM (
-	SELECT
-		token, group_chat_id, user_id, status, question_sent, owner_status_message_id, group_prompt_message_id, group_link, created_at, updated_at,
-		ROW_NUMBER() OVER (
-			PARTITION BY group_chat_id, user_id
-			ORDER BY datetime(created_at) DESC, token DESC
-		) AS rn
-	FROM pending_verifications
-	WHERE status = ?
-)
-WHERE rn > 1;
-`
+func (r *SQLiteRepository) GetPendingByUser(ctx context.Context, userID int64) (*JoinRequest, error) {
+	query := `SELECT ` + joinRequestColumns + `
+FROM join_requests
+WHERE user_id = ? AND status = ?
+ORDER BY created_at DESC
+LIMIT 1;`
+	return scanJoinRequestRow(r.db.QueryRowContext(ctx, query, userID, string(StatusPending)))
+}
 
-	rows, err := r.db.QueryContext(ctx, duplicatesQuery, string(StatusPending))
-	if err != nil {
-		return nil, fmt.Errorf("query duplicate pending rows: %w", err)
-	}
-	defer rows.Close()
-
-	duplicates := make([]Verification, 0)
-	for rows.Next() {
-		var v Verification
-		var status string
-		var createdRaw string
-		var updatedRaw string
-		var sentInt int
-		if err := rows.Scan(&v.Token, &v.GroupChatID, &v.UserID, &status, &sentInt, &v.OwnerStatusMessageID, &v.GroupPromptMessageID, &v.GroupLink, &createdRaw, &updatedRaw); err != nil {
-			return nil, fmt.Errorf("scan duplicate pending row: %w", err)
-		}
-		v.Status = Status(status)
-		v.QuestionSent = sentInt == 1
-		createdAt, err := parseSQLiteTime(createdRaw)
-		if err != nil {
-			return nil, fmt.Errorf("parse duplicate created_at: %w", err)
-		}
-		updatedAt, err := parseSQLiteTime(updatedRaw)
-		if err != nil {
-			return nil, fmt.Errorf("parse duplicate updated_at: %w", err)
-		}
-		v.CreatedAt = createdAt
-		v.UpdatedAt = updatedAt
-		duplicates = append(duplicates, v)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate duplicate pending rows: %w", err)
+func (r *SQLiteRepository) ClaimStatus(ctx context.Context, token string, from []Status, to Status) (bool, error) {
+	if len(from) == 0 {
+		return false, errors.New("claim status: empty from list")
 	}
 
-	if len(duplicates) == 0 {
-		return duplicates, nil
+	placeholders := make([]string, 0, len(from))
+	args := make([]any, 0, len(from)+2)
+	args = append(args, string(to), token)
+	for _, status := range from {
+		placeholders = append(placeholders, "?")
+		args = append(args, string(status))
 	}
 
-	tx, err := r.db.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, fmt.Errorf("begin sanitize transaction: %w", err)
-	}
-	defer tx.Rollback()
-
-	for _, duplicate := range duplicates {
-		if _, err := tx.ExecContext(ctx, `
-UPDATE pending_verifications
+	query := `
+UPDATE join_requests
 SET status = ?, updated_at = CURRENT_TIMESTAMP
-WHERE token = ? AND status = ?;
-`, string(StatusCancelled), duplicate.Token, string(StatusPending)); err != nil {
-			return nil, fmt.Errorf("cancel duplicate pending token %s: %w", duplicate.Token, err)
-		}
-	}
+WHERE token = ? AND status IN (` + strings.Join(placeholders, ", ") + `);`
 
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("commit sanitize transaction: %w", err)
+	result, err := r.db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return false, fmt.Errorf("claim status: %w", err)
 	}
-
-	return duplicates, nil
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("claim status rows affected: %w", err)
+	}
+	return affected > 0, nil
 }
 
 func (r *SQLiteRepository) SetStatus(ctx context.Context, token string, status Status) error {
 	const query = `
-UPDATE pending_verifications
+UPDATE join_requests
 SET status = ?, updated_at = CURRENT_TIMESTAMP
 WHERE token = ?;
 `
@@ -246,29 +180,9 @@ WHERE token = ?;
 	return nil
 }
 
-func (r *SQLiteRepository) SetQuestionSent(ctx context.Context, token string, sent bool) error {
-	const query = `
-UPDATE pending_verifications
-SET question_sent = ?, updated_at = CURRENT_TIMESTAMP
-WHERE token = ?;
-`
-	result, err := r.db.ExecContext(ctx, query, boolToInt(sent), token)
-	if err != nil {
-		return fmt.Errorf("set question sent: %w", err)
-	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("set question sent rows affected: %w", err)
-	}
-	if affected == 0 {
-		return sql.ErrNoRows
-	}
-	return nil
-}
-
 func (r *SQLiteRepository) SetOwnerStatusMessageID(ctx context.Context, token string, messageID int64) error {
 	const query = `
-UPDATE pending_verifications
+UPDATE join_requests
 SET owner_status_message_id = ?, updated_at = CURRENT_TIMESTAMP
 WHERE token = ?;
 `
@@ -286,40 +200,78 @@ WHERE token = ?;
 	return nil
 }
 
-func (r *SQLiteRepository) SetGroupPromptMessageID(ctx context.Context, token string, messageID int64) error {
-	const query = `
-UPDATE pending_verifications
-SET group_prompt_message_id = ?, updated_at = CURRENT_TIMESTAMP
-WHERE token = ?;
-`
-	result, err := r.db.ExecContext(ctx, query, messageID, token)
+func (r *SQLiteRepository) ListPendingOlderThan(ctx context.Context, cutoff time.Time, limit int) ([]JoinRequest, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	query := `SELECT ` + joinRequestColumns + `
+FROM join_requests
+WHERE status = ? AND datetime(created_at) <= datetime(?)
+ORDER BY created_at
+LIMIT ?;`
+
+	rows, err := r.db.QueryContext(ctx, query, string(StatusPending), cutoff.UTC().Format(sqliteTimeLayout), limit)
 	if err != nil {
-		return fmt.Errorf("set group prompt message id: %w", err)
+		return nil, fmt.Errorf("list expired pending: %w", err)
+	}
+	defer rows.Close()
+
+	requests := make([]JoinRequest, 0)
+	for rows.Next() {
+		req, err := scanJoinRequestRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		requests = append(requests, *req)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate expired pending: %w", err)
+	}
+	return requests, nil
+}
+
+func (r *SQLiteRepository) MarkUpdateProcessed(ctx context.Context, updateID int64) (bool, error) {
+	const query = `INSERT INTO processed_updates(update_id) VALUES(?) ON CONFLICT(update_id) DO NOTHING;`
+	result, err := r.db.ExecContext(ctx, query, updateID)
+	if err != nil {
+		return false, fmt.Errorf("mark update processed: %w", err)
 	}
 	affected, err := result.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("set group prompt message id rows affected: %w", err)
+		return false, fmt.Errorf("mark update processed rows affected: %w", err)
 	}
-	if affected == 0 {
-		return sql.ErrNoRows
+	return affected > 0, nil
+}
+
+func (r *SQLiteRepository) PurgeProcessedUpdates(ctx context.Context, before time.Time) error {
+	const query = `DELETE FROM processed_updates WHERE datetime(created_at) <= datetime(?);`
+	if _, err := r.db.ExecContext(ctx, query, before.UTC().Format(sqliteTimeLayout)); err != nil {
+		return fmt.Errorf("purge processed updates: %w", err)
 	}
 	return nil
 }
 
-func scanVerification(row *sql.Row) (*Verification, error) {
-	var v Verification
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanJoinRequestRow(row rowScanner) (*JoinRequest, error) {
+	var req JoinRequest
 	var status string
 	var createdRaw string
 	var updatedRaw string
-	var sentInt int
-	if err := row.Scan(&v.Token, &v.GroupChatID, &v.UserID, &status, &sentInt, &v.OwnerStatusMessageID, &v.GroupPromptMessageID, &v.GroupLink, &createdRaw, &updatedRaw); err != nil {
+	if err := row.Scan(
+		&req.Token, &req.GroupChatID, &req.GroupTitle, &req.GroupLink,
+		&req.UserID, &req.UserChatID, &req.UserLabel, &req.Bio,
+		&req.OwnerStatusMessageID, &status, &createdRaw, &updatedRaw,
+	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, sql.ErrNoRows
 		}
-		return nil, fmt.Errorf("scan verification: %w", err)
+		return nil, fmt.Errorf("scan join request: %w", err)
 	}
-	v.Status = Status(status)
-	v.QuestionSent = sentInt == 1
+	req.Status = Status(status)
+
 	createdAt, err := parseSQLiteTime(createdRaw)
 	if err != nil {
 		return nil, fmt.Errorf("parse created_at: %w", err)
@@ -328,14 +280,14 @@ func scanVerification(row *sql.Row) (*Verification, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse updated_at: %w", err)
 	}
-	v.CreatedAt = createdAt
-	v.UpdatedAt = updatedAt
-	return &v, nil
+	req.CreatedAt = createdAt
+	req.UpdatedAt = updatedAt
+	return &req, nil
 }
 
 func parseSQLiteTime(value string) (time.Time, error) {
 	layouts := []string{
-		"2006-01-02 15:04:05",
+		sqliteTimeLayout,
 		time.RFC3339,
 		time.RFC3339Nano,
 	}
@@ -346,38 +298,4 @@ func parseSQLiteTime(value string) (time.Time, error) {
 		}
 	}
 	return time.Time{}, fmt.Errorf("unknown sqlite time format: %s", value)
-}
-
-func boolToInt(v bool) int {
-	if v {
-		return 1
-	}
-	return 0
-}
-
-func (r *SQLiteRepository) columnExists(ctx context.Context, table string, column string) (bool, error) {
-	rows, err := r.db.QueryContext(ctx, fmt.Sprintf("PRAGMA table_info(%s);", table))
-	if err != nil {
-		return false, err
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var cid int
-		var name string
-		var typ string
-		var notnull int
-		var dfltValue sql.NullString
-		var pk int
-		if err := rows.Scan(&cid, &name, &typ, &notnull, &dfltValue, &pk); err != nil {
-			return false, err
-		}
-		if name == column {
-			return true, nil
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return false, err
-	}
-	return false, nil
 }
